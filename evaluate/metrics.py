@@ -56,14 +56,15 @@ def ACC(real, predict):
 
 def MAP(real, predict):
     sum = 0.0
-    for id, val in enumerate(real):
-        try:
-            index = predict.index(val)
-        except ValueError:
-            index = -1
-        if index != -1: sum = sum + (id + 1) / float(index + 1)
-    return sum / float(len(real))
-
+    cur = 1
+    l = len(real)
+    for id, val in enumerate(predict):
+        if val in real:
+            sum = sum + cur / (id+1)
+            cur+=1
+            if cur == l:
+                break
+    return sum / l
 
 def MRR(real, predict):
     sum = 0.0
@@ -73,7 +74,7 @@ def MRR(real, predict):
         except ValueError:
             index = -1
         if index != -1: sum = sum + 1.0 / float(index + 1)
-    return sum / float(len(real))
+    return sum / float(min(len(predict), len(real)))
 
 
 def NDCG(real, predict):

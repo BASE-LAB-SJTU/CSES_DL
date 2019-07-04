@@ -1,26 +1,18 @@
 from __future__ import print_function
 
+from methods.deepcs.code_searcher import CodeSearcher
+import traceback
+import argparse
+from methods.deepcs import configs
+
 import os
-
-from DeepCS.CodeSeacher import CodeSearcher
-
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import keras.backend.tensorflow_backend as KTF
 import tensorflow as tf
-
 config = tf.ConfigProto()
-config.gpu_options.allow_growth=True   # assign with requirement
+config.gpu_options.allow_growth = True   # assign with requirement
 sess = tf.Session(config=config)
-
 KTF.set_session(sess)
-
-import random
-import traceback
-from DeepCS.models import *
-import argparse
-random.seed(42)
-from DeepCS import configs
-
 
 def parse_args():
     parser = argparse.ArgumentParser("Train and Test Code Search(Embedding) Model")
@@ -46,7 +38,6 @@ if __name__ == '__main__':
     codesearcher = CodeSearcher(conf)
 
     ##### Define model ######
-    logger.info('Build Model')
     model = eval(conf['model_params']['model_name'])(conf)#initialize the model
     model.build()
     optimizer = conf.get('training_params', dict()).get('optimizer', 'adam')
@@ -62,19 +53,12 @@ if __name__ == '__main__':
             codesearcher.load_model_epoch(model, conf['training_params']['reload'])
         codesearcher.eval(model,-1,10)
 
-    elif args.mode=='fast_eval':
+    elif args.mode=='faster_eval':
         # evaluate for a particular epoch
         #load model
         if conf['training_params']['reload']>0:
             codesearcher.load_model_epoch(model, conf['training_params']['reload'])
-        codesearcher.fast_eval(model,-1,10)
-
-    elif args.mode=='eval_javadoc':
-        if conf['training_params']['reload']>0:
-            codesearcher.load_model_epoch(model, conf['training_params']['reload'])
-        path = args.path
-        print("dir path:", path)
-        codesearcher.fast_eval(model, 2000,10, True, path)
+        codesearcher.faster_eval(model,10)
 
     elif args.mode=='repr_code':
         #load model
@@ -87,7 +71,7 @@ if __name__ == '__main__':
         if conf['training_params']['reload']>0:
             codesearcher.load_model_epoch(model, conf['training_params']['reload'])
         codesearcher.load_code_reprs()
-        codesearcher.load_codebase()
+        codesearcher.load_use_codebase()
         while True:
             try:
                 query = input('Input Query: ')
@@ -104,12 +88,15 @@ if __name__ == '__main__':
             results = '\n\n'.join(map(str,zipped)) #combine the result into a returning string
             print(results)
 
+    elif args.mode=='save_codebase':
+        codesearcher.save_eval_codebase_vector_iter(model)
+
     elif args.mode=='search_once':
         #search code based on a desc
         if conf['training_params']['reload']>0:
             codesearcher.load_model_epoch(model, conf['training_params']['reload'])
         codesearcher.load_code_reprs()
-        codesearcher.load_codebase()
+        codesearcher.load_use_codebase()
         try:
             query = args.query
             n_results = int(args.n)

@@ -7,28 +7,18 @@ import random
 import threading
 import time
 import traceback
-
-import keras.backend.tensorflow_backend as KTF
+import os
+import numpy as np
+import logging
 import tables
-import tensorflow as tf
 from scipy.stats import rankdata
+from evaluate import metrics
 
-import evaluate_metrics
-from DeepCS import configs
-from DeepCS.configs import get_config
-from DeepCS.models import *
-from DeepCS.utils import normalize, cos_np_for_normalized
-
+from methods.deepcs.utils import normalize, cos_np_for_normalized
+from methods.preprocess import query2list
 random.seed(42)
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-config = tf.ConfigProto()
-config.gpu_options.allow_growth = True  # assign with requirement
-sess = tf.Session(config=config)
-KTF.set_session(sess)
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s: %(name)s: %(levelname)s: %(message)s")
-
 
 class CodeSearcher:
     def __init__(self, conf=None):
@@ -44,7 +34,7 @@ class CodeSearcher:
         self.vocab_desc = self.load_pickle(self.path + self.data_params['vocab_desc'])
 
         self._eval_sets = None
-
+        self.codebase_id = None
         self._code_reprs = None
         self._code_base = None
         self._code_base_chunksize = 2000000
@@ -52,8 +42,7 @@ class CodeSearcher:
     def load_pickle(self, filename):
         return pickle.load(open(filename, 'rb'))
 
-        ##### Data Set #####
-
+    ##### Data Set #####
     def load_training_data_chunk(self, offset, chunk_size):
         logger.debug('Loading a chunk of training data..')
         logger.debug('methname')
@@ -88,47 +77,25 @@ class CodeSearcher:
         tokens = self.load_hdf5(self.path + self.data_params['use_tokens'], 0, -1)
         return methnames, apiseqs, tokens
 
-    def load_codebase(self, javadoc=False):
+    def load_use_codebase(self):
         """load codebase
         codefile: h5 file that stores raw code
         """
         logger.info('Loading codebase (chunk size={})..'.format(self._code_base_chunksize))
-        if self._code_base == None:
-            codebase = []
-            # codes=codecs.open(self.path+self.data_params['use_codebase']).readlines()
-            docname = self.data_params['use_codebase']
-            if javadoc == True:
-                docname = self.data_params['use_javadoc_codebase']
-            with codecs.open(self.path + docname, encoding='utf8', errors='replace').xreadlines() as codes:
-                # use codecs to read in case of encoding problem
-                chunklist = []
-                line_count = 0
-                for i in codes:
-                    line_count += 1
-                    chunklist.append(i)
-                    if len(chunklist) == self._code_base_chunksize:
-                        codebase.append(chunklist)
-                        chunklist = []
-                        gc.collect()
-                if len(chunklist) > 0:
-                    codebase.append(chunklist)
-                print("total line:" + str(line_count))
-            self._code_base = codebase
+        if self._code_base==None:
+            codebase=[]
+            #codes=codecs.open(self.path+self.data_params['use_codebase']).readlines()
+            codes=codecs.open(self.path+self.data_params['use_codebase'],encoding='utf8',errors='replace').readlines()
+                #use codecs to read in case of encoding problem
+            for i in range(0,len(codes),self._code_base_chunksize):
+                codebase.append(codes[i:i+self._code_base_chunksize])
+            self._code_base=codebase
 
-    def load_json_query(self):
-        """load test query and true result ids from json file
-        """
-        querys, true_results = [], []
-        with open(self.data_params['json_test_query'], 'r')as query_f:
-            query_list = json.load(query_f)
-            for q in query_list:
-                querys.append(q['query'])
-                true_results.append(q['answerList'])
-        return querys, true_results
-
-    def load_MAT_json_dir(self, dir, poolsize):
+    ##### Evaluation Data Set #####
+    def load_MAT_json_dir(self, poolsize):
         logger.info("get json file name list from directory...")
         fileList = []
+        dir = self.path + self.data_params['eval_codebase_json_dir']
         files = os.listdir(dir)
         for f in files:
             if f[0] == '.' or os.path.isdir(dir + '/' + f):  # filter hiden file and directory
@@ -147,7 +114,7 @@ class CodeSearcher:
                     tks.append(code["tokens"])
                     ids.append(code["id"])
                 print(fname, " three size:", len(apiseq))
-        if 0 < poolsize < len(apiseq):
+        if poolsize < len(apiseq) and poolsize!=-1:
             methname = methname[:poolsize]
             apiseq = methname[:poolsize]
             tks = tks[:poolsize]
@@ -155,21 +122,145 @@ class CodeSearcher:
         print("total size:", len(apiseq))
         return methname, apiseq, tks, ids
 
-    # load javadoc query results for test
-    def load_javadoc_data(self, json_dir, poolsize):
+    def load_eval_codebase(self, poolsize):
         logger.debug('Loading a chunk of validation data..')
-        chunk_methnames, chunk_apiseqs, chunk_tokens, ids = self.load_MAT_json_dir(json_dir, poolsize)
-        chunk_descs, true_results = self.load_json_query()
-        chunk_tokens = [self.convert(self.vocab_tokens, i) for i in chunk_tokens]
-        chunk_apiseqs = [self.convert(self.vocab_apiseq, i) for i in chunk_apiseqs]
-        chunk_methnames = [self.convert(self.vocab_methname, i) for i in chunk_methnames]
-        chunk_descs = [self.convert(self.vocab_desc, i) for i in chunk_descs]
-        return chunk_methnames, chunk_apiseqs, chunk_tokens, ids, chunk_descs, true_results
+        chunk_methnames, chunk_apiseqs, chunk_tokens, ids = self.load_MAT_json_dir(poolsize)
+        chunk_tokens=[self.convert(self.vocab_tokens, i) for i in chunk_tokens]
+        chunk_apiseqs=[self.convert(self.vocab_apiseq, i) for i in chunk_apiseqs]
+        chunk_methnames=[self.convert(self.vocab_methname, i) for i in chunk_methnames]
+        return chunk_methnames, chunk_apiseqs, chunk_tokens, ids
 
-    ### Results Data ###
+    ### save evaluation codebase in vector representations by iteration to avoid memory overflow ###
+    def save_eval_codebase_vector_iter(self, model):
+        logger.info("get json file name list from directory...")
+        fileList = []
+        json_dir = self.data_params['eval_codebase_json']
+        files = os.listdir(json_dir)
+
+        for f in files:
+            if f[0] == '.' or os.path.isdir(json_dir + '/' + f):  # filter hidden file and directory
+                continue
+            elif ".json" not in f[-5:]:  # filter json file
+                continue
+            fileList.append(f)
+
+        logger.info("save evaluation codebase in vector representations by iteration...")
+        ids = []
+        fvec = tables.open_file(self.path + self.data_params['eval_codevecs'], 'w')
+        filters = tables.Filters(complib='blosc', complevel=5)
+
+        opend = True
+        for fname in fileList:
+            apiseqs, methnames, tokens = [], [], [],
+            with open(json_dir + fname, 'r') as load_f:
+                load_dict = json.load(load_f)
+                for code in load_dict:
+                    apiseqs.append(code["apiseq"])
+                    methnames.append(code["methname"])
+                    tokens.append(code["tokens"])
+                    ids.append(code["id"])
+                tokens = [self.convert(self.vocab_tokens, i) for i in tokens]
+                apiseqs = [self.convert(self.vocab_apiseq, i) for i in apiseqs]
+                methnames = [self.convert(self.vocab_methname, i) for i in methnames]
+                methnames = self.pad(methnames, self.data_params['methname_len'])
+                apiseqs = self.pad(apiseqs, self.data_params['apiseq_len'])
+                tokens = self.pad(tokens, self.data_params['tokens_len'])
+                vecs = model.repr_code([methnames, apiseqs, tokens], batch_size=1000)
+                del methnames, apiseqs, tokens
+                gc.collect()
+                vecs = vecs.astype('float32')
+                vecs = normalize(vecs)
+                npvecs = np.array(vecs)
+                if opend:
+                    opend = False
+                    ds = fvec.create_earray(fvec.root, 'vecs', tables.Atom.from_dtype(npvecs.dtype), (0, 400),
+                                            filters=filters)
+                ds.append(vecs)
+        fvec.close()
+        with open(self.path + self.data_params['eval_codebase_id'], 'w') as write_f:
+            for id in ids:
+                write_f.writelines(id + " ")
+
+    ### save evaluation codebase in vector representations ###
+    def save_eval_codebase_vector(self, model, poolsize):
+        logger.info('save eval codebase vector..')
+
+        methnames, apiseqs, tokens, ids = self.load_eval_codebase(poolsize)
+        methnames = self.pad(methnames, self.data_params['methname_len'])
+        apiseqs = self.pad(apiseqs, self.data_params['apiseq_len'])
+        tokens = self.pad(tokens, self.data_params['tokens_len'])
+        vecs = model.repr_code([methnames, apiseqs, tokens], batch_size=1000)
+        del methnames, apiseqs, tokens
+        gc.collect()
+        vecs = vecs.astype('float32')
+        vecs = normalize(vecs)
+        self.save_code_reprs(vecs,'eval_codevecs')
+        with open(self.path + self.data_params['eval_codebase_id'], 'w') as write_f:
+            for id in ids:
+                write_f.writelines(id + " ")
+
+    def load_eval_codebase_vector(self):
+        logger.debug('Loading code vectors (chunk size={})..'.format(self._code_base_chunksize))
+        if self._code_reprs==None:
+            """reads vectors (2D numpy array) from a hdf5 file"""
+            codereprs=[]
+            h5f = tables.open_file(self.path + self.data_params['eval_codevecs'])
+            vecs= h5f.root.vecs
+            for i in range(0,len(vecs),self._code_base_chunksize):
+                codereprs.append(vecs[i:i+self._code_base_chunksize])
+            h5f.close()
+            self._code_reprs=codereprs
+        return self._code_reprs
+
+    def load_eval_query_from_json(self):
+        """load test query and true result ids from json file"""
+        querys, true_results = [], []
+        with open(self.path + self.data_params['eval_query'], 'r')as query_f:
+            query_list = json.load(query_f)
+            for q in query_list:
+                querys.append(q['query'])
+                true_results.append(q['answerList'])
+        return querys, true_results
+
+    def load_eval_query(self):
+        chunk_descs, true_results = self.load_eval_query_from_json()
+        return  chunk_descs,true_results
+
+    def load_eval_codebase_id(self):
+        res = []
+        with open(self.path + self.data_params['eval_codebase_id'], 'r') as load_f:
+            vecs = load_f.read().split(" ")
+            for i in range(0, len(vecs), self._code_base_chunksize):
+                res.append(vecs[i:i + self._code_base_chunksize])
+            self.codebase_id = res
+
+    ##### Compute Representation #####
+    def repr_code(self, model):
+        methnames, apiseqs, tokens = self.load_use_data()
+        methnames = self.pad(methnames, self.data_params['methname_len'])
+        apiseqs = self.pad(apiseqs, self.data_params['apiseq_len'])
+        tokens = self.pad(tokens, self.data_params['tokens_len'])
+
+        vecs = model.repr_code([methnames, apiseqs, tokens], batch_size=1000)
+        del methnames, apiseqs, tokens
+        gc.collect()
+        vecs = vecs.astype('float32')
+        vecs = normalize(vecs)
+        self.save_code_reprs(vecs)
+        return vecs
+
+    def save_code_reprs(self, vecs, phrase='use_codevecs'):
+        npvecs = np.array(vecs)
+        fvec = tables.open_file(self.path + self.data_params[phrase], 'w')
+        atom = tables.Atom.from_dtype(npvecs.dtype)
+        filters = tables.Filters(complib='blosc', complevel=5)
+        ds = fvec.create_carray(fvec.root, 'vecs', atom, npvecs.shape, filters=filters)
+        ds[:] = npvecs
+        fvec.close()
+
     def load_code_reprs(self):
         logger.debug('Loading code vectors (chunk size={})..'.format(self._code_base_chunksize))
-        if self._code_reprs == None:
+        if self._code_reprs is None:
             """reads vectors (2D numpy array) from a hdf5 file"""
             codereprs = []
             h5f = tables.open_file(self.path + self.data_params['use_codevecs'])
@@ -179,15 +270,6 @@ class CodeSearcher:
             h5f.close()
             self._code_reprs = codereprs
         return self._code_reprs
-
-    def save_code_reprs(self, vecs):
-        npvecs = np.array(vecs)
-        fvec = tables.open_file(self.path + self.data_params['use_codevecs'], 'w')
-        atom = tables.Atom.from_dtype(npvecs.dtype)
-        filters = tables.Filters(complib='blosc', complevel=5)
-        ds = fvec.create_carray(fvec.root, 'vecs', atom, npvecs.shape, filters=filters)
-        ds[:] = npvecs
-        fvec.close()
 
     def load_hdf5(self, vecfile, start_offset, chunk_size):
         """reads training sentences(list of int array) from a hdf5 file"""
@@ -213,8 +295,7 @@ class CodeSearcher:
         table.close()
         return sents
 
-        ##### Converting / reverting #####
-
+    ##### Converting / reverting #####
     def convert(self, vocab, words):
         """convert words into indices"""
         if type(words) == str:
@@ -335,8 +416,7 @@ class CodeSearcher:
 
         return top1, mrr
 
-        ##### Evaluation in the develop set #####
-
+    ##### Evaluation in the develop set #####
     def eval(self, model, poolsize, K):
         """
         validate in a code pool.
@@ -368,10 +448,10 @@ class CodeSearcher:
             predict = predict[:n_results]
             predict = [int(k) for k in predict]
             real = [i]
-            acc += evaluate_metrics.ACC(real, predict)
-            mrr += evaluate_metrics.MRR(real, predict)
-            map += evaluate_metrics.MAP(real, predict)
-            ndcg += evaluate_metrics.NDCG(real, predict)
+            acc += metrics.ACC(real, predict)
+            mrr += metrics.MRR(real, predict)
+            map += metrics.MAP(real, predict)
+            ndcg += metrics.NDCG(real, predict)
         acc = acc / float(data_len)
         mrr = mrr / float(data_len)
         map = map / float(data_len)
@@ -380,84 +460,65 @@ class CodeSearcher:
 
         return acc, mrr, map, ndcg
 
-    ##### Evaluation in the develop set #####
-    def fast_eval(self, model, poolsize, K, javadoc=False, json_dir='/mnt/sdb/yh/deepcs/data/'):
-        output_log = open('eval1000.csv', 'w')
+    ##### Evaluation with multithreading and codebase vector representation #####
+    def faster_eval(self, model, n_results):
+        # eval result init
+        output_log = open(self.path + self.data_params['eval_log'], 'w')
         csv_writer = csv.writer(output_log, dialect='excel')
-        csv_writer.writerow(['id', 'acc', 'mrr', 'map', 'ndcg', 'f', 'firstpos'])
-        time_start = time.time()
+        csv_writer.writerow(['id', 'acc', 'mrr', 'map', 'firstpos'])
+
         # load valid dataset
-        ids, true_results = [], []
-        methnames, apiseqs, tokens, descs = self.load_valid_data_chunk(poolsize)
-        if javadoc:
-            methnames, apiseqs, tokens, ids, descs, true_results = self.load_javadoc_data(json_dir, poolsize)
-        acc, mrr, map, ndcg, f, fpos = 0, 0, 0, 0, 0, 0
+        self.load_code_reprs()
+        descs, true_results = self.load_eval_query()
+        self.load_eval_codebase_id()
         data_len = len(descs)
-        print("Total : " + str(data_len))
-        methnames = self.pad(methnames, self.data_params['methname_len'])
-        apiseqs = self.pad(apiseqs, self.data_params['apiseq_len'])
-        tokens = self.pad(tokens, self.data_params['tokens_len'])
-        print("methname", methnames)
-        print("apiseqs", apiseqs)
-        print("tokens", tokens)
+
         for i in range(data_len):
             real = true_results[i]
-            print("real", real)
-            print(i)
-            desc = descs[i]  # good desc
-            # print("desc:", desc)
-            desc_exp = self.pad([desc] * len(apiseqs), self.data_params['desc_len'])
-            # print("descs:", descs)
-            n_results = K
-            sims = model.predict([methnames, apiseqs, tokens, desc_exp], batch_size=data_len).flatten()
-            negsims = np.negative(sims)
-            predict = np.argsort(negsims)  # predict = np.argpartition(negsims, kth=n_results-1)
-            predict = [int(k) for k in predict]
-            predict = [ids[k] for k in predict]  # from local id to global id
-            temp_pos = evaluate_metrics.firstPos(real, predict)
-            fpos += temp_pos
+            desc = query2list(descs[i])
+            desc = [self.convert(self.vocab_desc, desc)]  # convert desc sentence to word indices
+
+            time_start = time.time()
+            padded_desc = self.pad(desc, self.data_params['desc_len'])
+            desc_repr = model.repr_desc([padded_desc])
+            desc_repr = desc_repr.astype('float32')
+            threads = []
+            predict = []
+            for i, code_reprs_chunk in enumerate(self._code_reprs):
+                t = threading.Thread(target=self.eval_thread,
+                                     args=(predict,desc_repr, code_reprs_chunk, i, n_results))
+                threads.append(t)
+                t.start()
+            for t in threads:  # wait until all sub-threads finish
+                t.join()
+            time_end = time.time()
+
+            predict.sort(reverse=True,key=lambda x: x[0])
             predict = predict[:n_results]
-            print("predict", predict)
-            temp_acc = evaluate_metrics.ACC(real, predict)
-            temp_mrr = evaluate_metrics.MRR(real, predict)
-            temp_map = evaluate_metrics.MAP(real, predict)
-            temp_ndcg = evaluate_metrics.NDCG(real, predict)
-            temp_f = evaluate_metrics.f_measure(real, predict)
-            acc += temp_acc
-            mrr += temp_mrr
-            map += temp_map
-            ndcg += temp_ndcg
-            f += temp_f
-            csv_writer.writerow([i, temp_acc, temp_mrr, temp_map, temp_ndcg, temp_f, temp_pos])
-        acc = acc / float(data_len)
-        mrr = mrr / float(data_len)
-        map = map / float(data_len)
-        ndcg = ndcg / float(data_len)
-        fpos = fpos / float(data_len)
-        f = f / float(data_len)
-        logger.info('ACC={}, MRR={}, MAP={}, nDCG={}, fpos={}, f={}'.format(acc, mrr, map, ndcg, fpos, f))
-        csv_writer.writerow(['total', acc, mrr, map, ndcg, f, fpos])
-        time_end = time.time()
-        cost_s = int(time_end - time_start)
-        cost_m = int(cost_s / 60)
-        cost_h = int(cost_m / 60)
-        print('totally cost :', cost_h, 'h', cost_m % 60, 'min', cost_s % 60, 's')
-        return acc, mrr, map, ndcg
+            predict = [i[1] for i in predict]
+            temp_pos = metrics.firstPos(real, predict)
+            predict = predict[:n_results]
+            temp_acc = metrics.ACC(real, predict)
+            temp_mrr = metrics.MRR(real, predict)
+            temp_map = metrics.MAP(real, predict)
+            temp_time = int(time_end - time_start)
+            csv_writer.writerow([i, temp_acc, temp_mrr, temp_map, temp_pos, temp_time])
+            logger.info('ID={}, ACC={}, MRR={}, MAP={}, fpos={}, time={}'.format(i, temp_acc, temp_mrr, temp_map, temp_pos, temp_time))
 
-    ##### Compute Representation #####
-    def repr_code(self, model):
-        methnames, apiseqs, tokens = self.load_use_data()
-        methnames = self.pad(methnames, self.data_params['methname_len'])
-        apiseqs = self.pad(apiseqs, self.data_params['apiseq_len'])
-        tokens = self.pad(tokens, self.data_params['tokens_len'])
+    def eval_thread(self,sims,desc_repr,code_reprs,i,n_results):
+        # 1. compute similarity
+        chunk_sims = cos_np_for_normalized(normalize(desc_repr), code_reprs)
 
-        vecs = model.repr_code([methnames, apiseqs, tokens], batch_size=1000)
-        del methnames, apiseqs, tokens
-        gc.collect()
-        vecs = vecs.astype('float32')
-        vecs = normalize(vecs)
-        self.save_code_reprs(vecs)
-        return vecs
+        # 2. choose top results
+        negsims = np.negative(chunk_sims[0])
+        maxinds = np.argpartition(negsims, kth=n_results - 1)
+        predict = maxinds[:n_results]
+
+        try:
+            sims.extend([(chunk_sims[0][predict],self.codebase_id[i][predict]) for predict in predict])
+        except Exception:
+            print("Exception while searching top entries:")
+            traceback.print_exc()
 
     def search(self, model, query, n_results=10):
         desc = [self.convert(self.vocab_desc, query)]  # convert desc sentence to word indices
@@ -516,29 +577,3 @@ class CodeSearcher:
                 final_codes.append(codes[i])
                 final_sims.append(sims[i])
         return zip(final_codes, final_sims)
-
-    def search_once(self, query, n_results=10):
-        ##### Define model ######
-        logger.info('Build Model')
-        conf = getattr(configs, get_config())()
-        model = eval(conf['model_params']['model_name'])(conf)  # initialize the model
-        model.build()
-        optimizer = conf.get('training_params', dict()).get('optimizer', 'adam')
-        model.compile(optimizer=optimizer)
-        epoch = conf['training_params']['reload']
-        #search code based on a desc
-        if epoch > 0:
-            self.load_model_epoch(model, epoch)
-        self.load_code_reprs()
-        self.load_codebase()
-        try:
-            codes, sims = self.search(model, query, n_results)
-            zipped = zip(codes, sims)
-            zipped = sorted(zipped, reverse=True, key=lambda x: x[1])
-            zipped = self.postproc(zipped)
-            zipped = list(zipped)[:n_results]
-            results = '\n\n'.join(map(str, zipped))  # combine the result into a returning string
-            return [i[0] for i in results]
-        except Exception:
-            print("Exception while parsing your input:")
-            traceback.print_exc()

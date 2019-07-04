@@ -6,3 +6,4 @@ tables
 numpy
 scipy
 scikit-learn
+nltk
