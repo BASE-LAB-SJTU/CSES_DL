@@ -1,7 +1,7 @@
-# CSES_ML
-Empirical Study For Code Search: ML-based methods
+# CSES_DL(ML)
+Empirical Study For Code Search: DL(ML)-based methods
 
-This project reproduced ML-base methods for code search.
+This project reproduced DL(ML)-base methods for code search.
 
 Methods include:
 
