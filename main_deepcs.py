@@ -1,6 +1,7 @@
 from __future__ import print_function
 
 from methods.deepcs.code_searcher import CodeSearcher
+from methods.deepcs.models import JointEmbeddingModel
 import traceback
 import argparse
 from methods.deepcs import configs

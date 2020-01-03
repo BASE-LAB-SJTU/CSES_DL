@@ -484,9 +484,9 @@ class CodeSearcher:
             desc_repr = desc_repr.astype('float32')
             threads = []
             predict = []
-            for i, code_reprs_chunk in enumerate(self._code_reprs):
+            for j, code_reprs_chunk in enumerate(self._code_reprs):
                 t = threading.Thread(target=self.eval_thread,
-                                     args=(predict,desc_repr, code_reprs_chunk, i, n_results))
+                                     args=(predict,desc_repr, code_reprs_chunk, j, n_results))
                 threads.append(t)
                 t.start()
             for t in threads:  # wait until all sub-threads finish
